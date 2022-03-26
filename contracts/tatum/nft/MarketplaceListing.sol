@@ -49,6 +49,7 @@ contract MarketplaceListing is Ownable {
 
     // List of all listings in the marketplace. All historical ones are here as well.
     mapping(string => Listing) private _listings;
+    mapping(string => uint256) private _listingsSold;
     string[] private _openListings;
     uint256 private _marketplaceFee;
     address private _marketplaceFeeRecipient;
@@ -113,6 +114,14 @@ contract MarketplaceListing is Ownable {
 
     function getMarketplaceFee() public view virtual returns (uint256) {
         return _marketplaceFee;
+    }
+
+    function shouldFinalizeListing(string memory listingId) internal view virtual returns (bool) {
+        Listing memory listing = _listings[listingId];
+
+        return !(!listing.isErc721 
+                && listing.erc20Address == address(0) 
+                && _listingsSold[listingId] < listing.amount);
     }
 
     function getMarketplaceFeeRecipient()
@@ -249,12 +258,19 @@ contract MarketplaceListing is Ownable {
     payable
     {
         Listing memory listing = _listings[listingId];
+        
+        bool useNativeTokens = listing.erc20Address == address(0);
+        uint256 fee = (listing.price * _marketplaceFee) / 10000;
+        uint256 basePrice = listing.price + fee;
+        uint256 quantity = listing.isErc721 ? 1 : (useNativeTokens ? (msg.value / basePrice) : listing.amount);
+
         if (listing.state != State.INITIATED) {
             if (msg.value > 0) {
                 Address.sendValue(payable(msg.sender), msg.value);
             }
             revert("Listing is in wrong state. Aborting.");
         }
+
         if (listing.isErc721) {
             if (
                 IERC721(listing.nftAddress).getApproved(listing.tokenId) !=
@@ -272,7 +288,7 @@ contract MarketplaceListing is Ownable {
                 IERC1155(listing.nftAddress).balanceOf(
                     listing.seller,
                     listing.tokenId
-                ) < listing.amount
+                ) < quantity
             ) {
                 if (msg.value > 0) {
                     Address.sendValue(payable(msg.sender), msg.value);
@@ -282,6 +298,7 @@ contract MarketplaceListing is Ownable {
                 );
             }
         }
+
         if (listing.erc20Address != erc20Address) {
             if (msg.value > 0) {
                 Address.sendValue(payable(msg.sender), msg.value);
@@ -290,11 +307,14 @@ contract MarketplaceListing is Ownable {
             "ERC20 token address as a payer method should be the same as in the listing. Either listing, or method call has wrong ERC20 address."
             );
         }
-        uint256 fee = (listing.price * _marketplaceFee) / 10000;
-        listing.state = State.SOLD;
+
+        if (!listing.isErc721) { _listingsSold[listingId] += quantity; }
+        if (shouldFinalizeListing(listingId)) { listing.state = State.SOLD; }
+
         listing.buyer = msg.sender;
         _listings[listingId] = listing;
         uint256 cashbackSum = 0;
+
         if (listing.isErc721) {
             if (_isTatumNFT(listing.nftAddress, listing.tokenId)) {
                 if (
@@ -309,22 +329,26 @@ contract MarketplaceListing is Ownable {
                 }
             }
         }
-        if (listing.erc20Address == address(0)) {
-            if (listing.price + fee > msg.value) {
+
+        if (useNativeTokens) {
+            if (basePrice > msg.value) {
                 if (msg.value > 0) {
                     Address.sendValue(payable(msg.sender), msg.value);
                 }
                 revert("Insufficient price paid for the asset.");
             }
-            Address.sendValue(payable(_marketplaceFeeRecipient), fee);
-            Address.sendValue(payable(listing.seller), listing.price);
+            
+            Address.sendValue(payable(_marketplaceFeeRecipient), fee * quantity);
+            Address.sendValue(payable(listing.seller), listing.price * quantity);
+            
             // Overpaid price is returned back to the sender
-            if (msg.value - listing.price - fee > 0) {
+            if (msg.value - basePrice * quantity > 0) {
                 Address.sendValue(
                     payable(msg.sender),
-                    msg.value - listing.price - fee
+                    msg.value - basePrice * quantity
                 );
             }
+
             if (listing.isErc721) {
                 IERC721(listing.nftAddress).safeTransferFrom{
                 value : cashbackSum
@@ -343,7 +367,7 @@ contract MarketplaceListing is Ownable {
                     listing.seller,
                     msg.sender,
                     listing.tokenId,
-                    listing.amount,
+                    quantity,
                     ""
                 );
             }
@@ -384,7 +408,8 @@ contract MarketplaceListing is Ownable {
                 );
             }
         }
-        _toRemove(listingId);
+
+        if (shouldFinalizeListing(listingId)){ _toRemove(listingId); }
         emit ListingSold(msg.sender, listingId);
     }
 
